@@ -1,6 +1,3 @@
-// Package example is a CoreDNS plugin that prints "example" to stdout on every packet received.
-//
-// It serves as an example CoreDNS plugin with numerous code comments.
 package bond_coredns
 
 import (
@@ -20,11 +17,8 @@ import (
 	"github.com/miekg/dns"
 )
 
-// Define log to be a logger with the plugin name in it. This way we can just use log.Info and
-// friends to log.
 var log = clog.NewWithPlugin("bond")
 
-// Example is an example plugin to show how to write a plugin.
 type BondCoreDns struct {
 	Next     plugin.Handler
 	Endpoint string
