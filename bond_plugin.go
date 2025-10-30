@@ -1,0 +1,150 @@
+// Package example is a CoreDNS plugin that prints "example" to stdout on every packet received.
+//
+// It serves as an example CoreDNS plugin with numerous code comments.
+package bond_coredns
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"net/url"
+	"strings"
+
+	"github.com/coredns/coredns/plugin"
+	"github.com/coredns/coredns/plugin/metrics"
+	clog "github.com/coredns/coredns/plugin/pkg/log"
+
+	"github.com/miekg/dns"
+)
+
+// Define log to be a logger with the plugin name in it. This way we can just use log.Info and
+// friends to log.
+var log = clog.NewWithPlugin("bond")
+
+// Example is an example plugin to show how to write a plugin.
+type BondCoreDns struct {
+	Next     plugin.Handler
+	Endpoint string
+}
+
+type NameResolution struct {
+	NostrNpub   string   `json:"npub"`
+	NostrRelays []string `json:"relays"`
+}
+
+func (b BondCoreDns) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+	qname, err := b.MsgToQname(r)
+	if err != nil {
+		return b.Finish(ctx, w, r)
+	}
+
+	nameResolution, err := b.NameToNostr(qname)
+	if err != nil {
+		return b.Finish(ctx, w, r)
+	}
+
+	ip, err := b.NostrToIP(nameResolution)
+	if err != nil {
+		return b.Finish(ctx, w, r)
+	}
+
+	return b.Reply(w, r, ip)
+}
+
+func (b BondCoreDns) Name() string { return "bond-coredns" }
+
+type ResponsePrinter struct {
+	dns.ResponseWriter
+}
+
+func NewResponsePrinter(w dns.ResponseWriter) *ResponsePrinter {
+	return &ResponsePrinter{ResponseWriter: w}
+}
+
+func (r *ResponsePrinter) WriteMsg(res *dns.Msg) error {
+	log.Info("Bond")
+	return r.ResponseWriter.WriteMsg(res)
+}
+
+func (b BondCoreDns) MsgToQname(r *dns.Msg) (string, error) {
+	if len(r.Question) == 0 {
+		return "", fmt.Errorf("no question in message")
+	}
+
+	qname := r.Question[0].Name
+
+	if strings.HasSuffix(qname, ".") {
+		qname = qname[:len(qname)-1]
+	}
+
+	log.Info("Requested domain: " + qname)
+	fmt.Println("Requested domain: ", qname)
+	return qname, nil
+}
+
+func (b BondCoreDns) NameToNostr(qname string) (*NameResolution, error) {
+	url := "http://" + b.Endpoint + "/name/" + url.PathEscape(qname)
+	client := &http.Client{}
+	resp, err := client.Get(url)
+
+	if err != nil {
+		log.Error("HTTP request failed: " + err.Error())
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	var result NameResolution
+
+	if err := json.Unmarshal(body, &result); err != nil {
+		log.Error("Failed to parse name resolution JSON: " + err.Error())
+		return nil, err
+	}
+
+	fmt.Println("npub:", result.NostrNpub)
+	fmt.Println("relays:", strings.Join(result.NostrRelays, ","))
+	return &result, nil
+}
+
+func (b BondCoreDns) NostrToIP(nameResolution *NameResolution) (net.IP, error) {
+	ip := "127.0.0.1"
+
+	parsed := net.ParseIP(ip)
+	if parsed == nil {
+		log.Error("invalid IP returned: " + ip)
+		return nil, fmt.Errorf("invalid IP returned: " + ip)
+	}
+
+	ipv4 := parsed.To4()
+	if ipv4 == nil {
+		log.Error("non-IPv4 address for A record: " + ip)
+		return nil, fmt.Errorf("non-IPv4 address for A record: " + ip)
+	}
+
+	fmt.Println("ip: " + ipv4.String())
+	return ipv4, nil
+}
+
+func (b BondCoreDns) Reply(w dns.ResponseWriter, r *dns.Msg, ip net.IP) (int, error) {
+	reply := new(dns.Msg)
+	reply.SetReply(r)
+
+	a := &dns.A{Hdr: dns.RR_Header{Name: r.Question[0].Name, Rrtype: dns.TypeA, Class: dns.ClassINET, Ttl: 60}, A: ip}
+	reply.Answer = append(reply.Answer, a)
+
+	if err := w.WriteMsg(reply); err != nil {
+		log.Error("failed to write DNS response: " + err.Error())
+		return dns.RcodeServerFailure, err
+	}
+
+	return dns.RcodeSuccess, nil
+}
+
+func (b BondCoreDns) Finish(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
+	pw := NewResponsePrinter(w)
+	requestCount.WithLabelValues(metrics.WithServer(ctx)).Inc()
+	return plugin.NextOrFailure(b.Name(), b.Next, ctx, pw, r)
+}
