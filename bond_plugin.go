@@ -9,7 +9,10 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 
+	"fiatjaf.com/nostr"
+	"fiatjaf.com/nostr/nip19"
 	"github.com/coredns/coredns/plugin"
 	"github.com/coredns/coredns/plugin/metrics"
 	clog "github.com/coredns/coredns/plugin/pkg/log"
@@ -27,6 +30,11 @@ type BondCoreDns struct {
 type NameResolution struct {
 	NostrNpub   string   `json:"npub"`
 	NostrRelays []string `json:"relays"`
+}
+
+type ResolvedIp struct {
+	at  time.Time
+	txt string
 }
 
 func (b BondCoreDns) ServeDNS(ctx context.Context, w dns.ResponseWriter, r *dns.Msg) (int, error) {
@@ -104,22 +112,60 @@ func (b BondCoreDns) NameToNostr(qname string) (*NameResolution, error) {
 }
 
 func (b BondCoreDns) NostrToIP(nameResolution *NameResolution) (net.IP, error) {
-	ip := "127.0.0.1"
-
-	parsed := net.ParseIP(ip)
-	if parsed == nil {
-		log.Error("invalid IP returned: " + ip)
-		return nil, fmt.Errorf("invalid IP returned: " + ip)
+	t, data, err := nip19.Decode(nameResolution.NostrNpub)
+	if err != nil || t != "npub" {
+		log.Error("invalid npub: %v", err)
+		return nil, fmt.Errorf("invalid npub: %v", err)
 	}
 
-	ipv4 := parsed.To4()
-	if ipv4 == nil {
-		log.Error("non-IPv4 address for A record: " + ip)
-		return nil, fmt.Errorf("non-IPv4 address for A record: " + ip)
+	pubKey := data.(nostr.PubKey)
+	limit := 10
+	timeout := 5 * time.Second
+	relays := nameResolution.NostrRelays
+
+	filter := nostr.Filter{
+		Authors: []nostr.PubKey{pubKey},
+		Kinds:   []nostr.Kind{nostr.KindTextNote},
+		Limit:   limit,
 	}
 
-	fmt.Println("ip: " + ipv4.String())
-	return ipv4, nil
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	pool := nostr.NewPool(nostr.PoolOptions{})
+	notes := pool.FetchMany(ctx, relays, filter, nostr.SubscriptionOptions{})
+
+	ip := ""
+	var latest time.Time
+	for note := range notes {
+		at := time.Unix(int64(note.Event.CreatedAt), 0)
+		if at.Before(latest) {
+			continue
+		}
+
+		var parsed = net.ParseIP(note.Event.Content)
+		if parsed == nil {
+			continue
+		}
+
+		var ipv4 = parsed.To4()
+		if ipv4 == nil {
+			continue
+		}
+
+		ip = ipv4.String()
+		latest = at
+	}
+
+	if ip == "" {
+		var relays = strings.Join(relays, ",")
+		var npub = nameResolution.NostrNpub
+		log.Error("no valid IPv4 address found for npub: %s on relays %s", npub, relays)
+		return nil, fmt.Errorf("no valid IPv4 address found for npub: %s on relays %s", npub, relays)
+	}
+
+	fmt.Println("resolved ip: " + ip)
+	return net.ParseIP(ip), nil
 }
 
 func (b BondCoreDns) Reply(w dns.ResponseWriter, r *dns.Msg, ip net.IP) (int, error) {
