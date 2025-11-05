@@ -1,6 +1,6 @@
 # Bond CoreDNS Plugin
 
-This CoreDNS plugin allows resolving `.btc`` domains to IPv4 addresses through Nostr through a Bond server.
+This CoreDNS plugin allows resolving `.btc` domains to IPv4 addresses posted in Nostr notes through a Bond server.
 
 ## Configuration
 ```
